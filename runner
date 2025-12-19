@@ -1,0 +1,96 @@
+param([string]$DomainController = ($env:LOGONSERVER -replace '\\'))
+
+Import-Module ActiveDirectory -ErrorAction Stop
+
+Write-Host "ESC1-8 Vulnerability Scanner voor AD CS Templates" -ForegroundColor Cyan
+
+# Config partition ophalen
+$ConfigNC = (Get-ADRootDSE -Server $DomainController).ConfigurationNamingContext
+$TemplatesPath = "CN=Certificate Templates,CN=Public Key Services,CN=Services,$ConfigNC"
+
+# Alle templates ophalen met juiste properties
+$Templates = Get-ADObject -Filter {objectClass -eq "pKICertificateTemplate"} `
+    -SearchBase $TemplatesPath -Server $DomainController -Properties * 
+
+$Results = @()
+
+foreach ($Template in $Templates) {
+    $Vulns = @()
+    $Name = $Template.Name
+    
+    # Enabled check: converteer array naar int
+    $EnabledFlag = 0
+    if ($Template.pKIEnabledTemplates) {
+        $EnabledFlag = [int]($Template.pKIEnabledTemplates | Select-Object -First 1)
+    }
+    if (($EnabledFlag -band 1) -ne 1) { continue }
+    
+    # ESC1: EnrolleeSuppliesSubject (bit 0) + ClientAuth EKU
+    $NameFlag = 0
+    if ($Template.'msPKI-Certificate-Name-Flag') {
+        $NameFlag = [int]($Template.'msPKI-Certificate-Name-Flag' | Select-Object -First 1)
+    }
+    $EnrolleeSuppliesSubject = ($NameFlag -band 1) -eq 1
+    $ClientAuthEKU = $false
+    if ($Template.pKIExtendedKeyUsage) {
+        $ClientAuthEKU = $Template.pKIExtendedKeyUsage -contains "1.3.6.1.5.5.7.3.2"
+    }
+    if ($EnrolleeSuppliesSubject -and $ClientAuthEKU) {
+        $Vulns += "ESC1"
+    }
+    
+    # ESC2: Vulnerable EKU (AnyPurpose of leeg)
+    $EKUs = @($Template.pKIExtendedKeyUsage)
+    $VulnerableEKU = ($EKUs.Count -eq 0) -or ($EKUs -contains "1.3.6.1.4.1.311.10.12.1")
+    if ($VulnerableEKU) {
+        try {
+            $SD = New-Object Security.AccessControl.DirectorySecurity
+            $SD.SetSecurityDescriptorSddlForm($Template.nTSecurityDescriptor)
+            $EnrollAccess = $SD.Access | Where-Object {
+                $_.IdentityReference -like "*Domain Users*" -and 
+                $_.ActiveDirectoryRights -match "ExtendedRight"
+            }
+            if ($EnrollAccess) { $Vulns += "ESC2" }
+        } catch { }
+    }
+    
+    # ESC3: Enrollment Agent EKU
+    if ($EKUs -contains "1.3.6.1.4.1.311.20.2.2") {
+        $Vulns += "ESC3"
+    }
+    
+    # ESC4: Write permissions voor Domain Users (vereenvoudigd)
+    try {
+        $SD = New-Object Security.AccessControl.DirectorySecurity
+        $SD.SetSecurityDescriptorSddlForm($Template.nTSecurityDescriptor)
+        $BadWrite = $SD.Access | Where-Object {
+            $_.IdentityReference -like "*Domain Users*" -and 
+            ($_.ActiveDirectoryRights.Value -band 0xF001F) -ne 0
+        }
+        if ($BadWrite) { $Vulns += "ESC4" }
+    } catch { }
+    
+    # ESC6 indicatie: Subject Alt Name mogelijk
+    if ($Template.pKICriticalExtensions -and 
+        $Template.pKICriticalExtensions -contains "2.5.29.17") {
+        $Vulns += "ESC6?"
+    }
+
+    if ($Vulns.Count -gt 0) {
+        $Results += [PSCustomObject]@{
+            Template = $Name
+            Vulnerabilities = ($Vulns -join ", ")
+            EKUs = ($EKUs -join "; ")
+            DistinguishedName = $Template.DistinguishedName
+        }
+        Write-Host "KWETSBAAR: $Name -> $($Vulns -join ', ')" -ForegroundColor Red
+    }
+}
+
+if ($Results.Count -eq 0) {
+    Write-Host "Geen kwetsbare templates gevonden!" -ForegroundColor Green
+} else {
+    $Results | Format-Table -AutoSize
+    $Results | Export-Csv "ESC_Vulns_$(Get-Date -f 'yyyyMMdd-HHmm').csv" -NoTypeInformation -Encoding UTF8
+    Write-Host "`n$($Results.Count) kwetsbare templates geëxporteerd naar CSV." -ForegroundColor Green
+}
